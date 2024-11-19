@@ -1,0 +1,79 @@
+spec:
+  inputs:
+    image:
+      default: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/terraform-images/stable:latest"
+    tf_root:
+      default: ${CI_PROJECT_DIR}/s3 # Changed to point to the s3 directory
+    tf_state_name:
+      default: terraform-state
+---
+variables:
+  TF_ROOT: $[[ inputs.tf_root ]]
+  TF_STATE_NAME: $[[ inputs.tf_state_name ]]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+
+.tf-image:
+  image: $[[ inputs.image ]]
+
+cache:
+  key: "${TF_ROOT}"
+  paths:
+    - ${TF_ROOT}/.terraform/ # This remains as it stores cache specific to this root
+
+terraform:validate:
+  stage: .pre
+  extends: .tf-image
+  script:
+    - cd ${TF_ROOT} # Navigate to the specified directory
+    - gitlab-terraform validate
+
+terraform:build:
+  stage: build
+  extends: .tf-image
+  script:
+    - cd ${TF_ROOT} # Navigate to the specified directory
+    - gitlab-terraform plan 
+    - gitlab-terraform plan-json
+  resource_group: ${TF_STATE_NAME}
+  id_tokens:
+    OIDC_TOKEN:
+      aud: https://gitlab.com
+  artifacts:
+    public: false
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+  needs:
+    - terraform:validate
+
+terraform:deploy:
+  stage: deploy
+  extends: .tf-image
+  script:
+    - cd ${TF_ROOT} # Navigate to the specified directory
+    - gitlab-terraform apply
+  resource_group: ${TF_STATE_NAME}
+  id_tokens:
+    OIDC_TOKEN:
+      aud: https://gitlab.com
+  rules:
+    - when: manual
+  needs:
+    - terraform:build
+
+terraform:destroy:
+  stage: deploy
+  extends: .tf-image
+  script:
+    - cd ${TF_ROOT} # Navigate to the specified directory
+    - gitlab-terraform destroy
+  resource_group: ${TF_STATE_NAME}
+  id_tokens:
+    OIDC_TOKEN:
+      aud: https://gitlab.com
+  when: manual
