@@ -1,0 +1,60 @@
+##SETUP ENVIRONMENT
+image:
+  name: registry.gitlab.com/gitlab-org/gitlab-build-images:terraform
+
+  
+variables:
+  PROJECTNAME: 
+    description: "Provide the name for the project"
+    value: "bw4hana"
+
+  ENVIRONMENT:
+    description: "Select the AWS environment"
+    value: prd #Varprojectenv
+    options:
+     # - dev
+     # - acc
+      - prd
+
+  Organisation_domain:
+    description: "Provide the Organisation domain service group"
+    value: "Project Services"
+
+  #get the gitlab variables for the user running the pipeline
+  GIT_USER_MAIL:
+    value:${GITLAB_USER_EMAIL}
+  GIT_USER:
+    value:${GITLAB_USER_NAME}
+
+
+###DEPLOY STAGES
+#Define stages #If not defined, only the default are available: build, deploy,...
+stages:
+  - aws-efs
+  - ec2
+  #- security
+
+
+###Stages definitions
+
+#Deploy EFS for BW4HANA
+aws-efs:
+  stage: aws-efs
+  trigger:
+    include:
+      - local: aws-efs/deploy_efs.yml
+
+#Deploy EC2 systems for BW4HANA
+ec2:
+  stage: ec2
+  trigger:
+    include:
+      - local: ec2/deploy-ec2.yml
+
+#Deploy security/iam systems for BW4HANA
+# security:
+#   stage: security
+#   trigger:
+#     include:
+#       - local: security/deploy-security.yml
+  
