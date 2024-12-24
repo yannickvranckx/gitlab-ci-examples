@@ -7,6 +7,7 @@ Gitlab CI Examples
 - example-gitlab-ci-openID.yml -> Regular spec input with OpenID
 - example-gitlab-ci-change-dir -> Change Directory with OpenID
 - example-gitlab-ci-branch-trigger -> Also trigger from branch
+- example-gitlab-ci-dir-structure -> A main CI file that can swap into seperate deploy folders
 
 
 
