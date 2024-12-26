@@ -1,0 +1,196 @@
+default:
+  # Default image matching Terraform required version
+  image: registry.gitlab.com/gitlab-org/terraform-images/releases/terraform:1.5.7  # terraform version. Change together with all providers.tf files, and .terraform-version file.
+  # See supported terraform versions here https://gitlab.com/gitlab-org/terraform-images/container_registry/1803074
+  # Unique cache per stack/env to improve Terraform initialization time
+  cache:
+    key: ${TF_STACK}-${TF_INSTANCE}
+    paths:
+      - ${TF_ROOT}/.terraform
+      - ${TF_ROOT}/.terraform.lock.hcl
+  # Tags to indicate the required Gitlab hosted runners
+  tags:
+    - saas-linux-small-amd64
+  # Configuration for Gitlab OpenID Connect (OIDC) for AWS
+  id_tokens:
+    GITLAB_JWT_TOKEN:
+      aud: https://gitlab.com
+
+# Include AWS assume role with web identity integration shared template
+include:
+  - project: ${NEO_TEMPLATE_REPO}
+    file: /gitlab-ci/assume-role.yml
+
+# Template and anchor for recurring commands for AWS CLI installation
+.aws-cli: &aws-cli
+  - apk add --quiet --no-cache python3 py3-pip
+  - pip3 install --quiet --upgrade pip
+  - pip3 install --quiet --no-cache-dir awscli
+  - rm -rf /var/cache/apk/*
+
+.checkov-cli: &checkov-cli
+  - apt-get -y -qq update
+  - export DEBIAN_FRONTEND=noninteractive && apt-get -y -qq install python3-pip
+  - pip3 install -U checkov
+
+# Template for default Terraform init job configuration
+.tf_init:
+  variables:
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_INSTANCE}
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+  script: # Leveraging Gitlab Terraform wrapper (https://gitlab.com/gitlab-org/terraform-images)
+    - gitlab-terraform --version
+    - gitlab-terraform init -upgrade
+  rules:
+    - when: always
+
+# Template for default Terraform format and validate job configuration
+.tf_validate:
+  variables:
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_INSTANCE}
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+  script: # Leveraging Gitlab Terraform wrapper (https://gitlab.com/gitlab-org/terraform-images)
+    - gitlab-terraform fmt -check=true
+    - gitlab-terraform validate
+  rules:
+    - when: on_success
+
+# Template for default Terraform tflint job configuration per environment
+.tf_lint_instances:
+  allow_failure: true
+  image:
+    name: ghcr.io/terraform-linters/tflint:latest
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+  script:
+    - tflint --init
+    - tflint --chdir=${TF_ROOT} --var-file=${CI_PROJECT_DIR}/stacks/${TF_STACK}/instances/${TF_INSTANCE}/${TF_INSTANCE}.tfvars --color --format=junit | tee ${CI_PROJECT_DIR}/tflint-${TF_INSTANCE}.xunit.xml
+  artifacts:
+    name: tflint-${ENV}-${CI_PIPELINE_ID}
+    reports:
+      junit:
+        - ${CI_PROJECT_DIR}/tflint-${TF_INSTANCE}.xunit.xml
+    paths:
+      - ${CI_PROJECT_DIR}/tflint-${TF_INSTANCE}.xunit.xml
+  rules:
+    - when: on_success
+
+# Template for default Terraform tflint job configuration per stack
+.tf_lint_modules:
+  allow_failure: true
+  image:
+    name: ghcr.io/terraform-linters/tflint:latest
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/modules
+  script:
+    - tflint --init
+    - tflint --chdir=${TF_ROOT} --disable-rule=terraform_required_providers --disable-rule=terraform_required_version --recursive --color --format=junit | tee  ${CI_PROJECT_DIR}/tflint-modules.xunit.xml
+  artifacts:
+    name: tflint-modules-${CI_PIPELINE_ID}
+    reports:
+      junit:
+        - ${CI_PROJECT_DIR}/tflint-modules.xunit.xml
+    paths:
+      - ${CI_PROJECT_DIR}/tflint-modules.xunit.xml
+  rules:
+    - when: on_success
+
+# Template for default Terraform checkov configuration
+.tf_checkov:
+  allow_failure: true
+  image:
+    name: registry.gitlab.com/luminusbe/luminusbe-neo/luminusbe-neo-shared/base_images/ubuntu:latest
+  variables:
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+  before_script: # Install Checkov CLI
+    - *checkov-cli
+  script:
+    - checkov --version
+    - checkov --directory ${TF_ROOT} --download-external-modules false --framework terraform --hard-fail-on HIGH -o junitxml | tee ${CI_PROJECT_DIR}/checkov-stack.xunit.xml
+  artifacts:
+    name: checkov-${TF_STACK}-${ENV}-${CI_PIPELINE_ID}
+    paths:
+      - ${CI_PROJECT_DIR}/checkov-stack.xunit.xml
+    reports:
+      junit:
+        - ${CI_PROJECT_DIR}/checkov-stack.xunit.xml
+  rules:
+    - when: on_success
+
+# Template for default Terraform plan job configuration
+.tf_plan:
+  resource_group: ${TF_INSTANCE} # Prevent multiple job executions for the same environment/state-file
+  variables:
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_INSTANCE}
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+    TF_PLAN_CACHE: ${TF_ROOT}/plan.cache
+    TF_PLAN_JSON: ${TF_ROOT}/plan.json
+  before_script: # Install AWS CLI and assume role with web identity
+    - *aws-cli
+    - !reference [.assume-role, script]
+  script: # Leveraging Gitlab Terraform wrapper (https://gitlab.com/gitlab-org/terraform-images)
+    - gitlab-terraform plan -var-file=${CI_PROJECT_DIR}/stacks/${TF_STACK}/instances/${TF_INSTANCE}/${TF_INSTANCE}.tfvars
+    - gitlab-terraform plan-json
+  artifacts: # Terraform plan artifact to be reported on merge request overview
+    name: tf-plan-${TF_INSTANCE}-${CI_PIPELINE_ID}
+    expire_in: 7 days
+    paths:
+      - ${TF_PLAN_JSON}
+      - ${TF_PLAN_CACHE}
+      - ${TF_ROOT}/lambda/*/main.zip
+    reports:
+      terraform: ${TF_PLAN_JSON}
+  rules:
+    - when: on_success
+
+# Template for default Terraform apply job configuration
+.tf_apply:
+  resource_group: ${TF_INSTANCE} # Prevent multiple job executions for the same environment/state-file
+  environment:
+    name: ${TF_INSTANCE}
+    auto_stop_in: never
+  variables:
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_INSTANCE}
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+    TF_PLAN_CACHE: ${TF_ROOT}/plan.cache
+    TF_PLAN_JSON: ${TF_ROOT}/plan.json
+  before_script: # Install AWS CLI and assume role with web identity
+    - *aws-cli
+    - !reference [.assume-role, script]
+  script: # Leveraging Gitlab Terraform wrapper (https://gitlab.com/gitlab-org/terraform-images)
+    - gitlab-terraform apply -auto-approve
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply for all environments on default branch
+      when: manual
+    - if: $TF_INSTANCE == "dev" # Only allow Terraform apply for DEV environment
+      when: manual
+    - when: never
+  timeout: 3h
+
+# Template for default Terraform destroy job configuration
+.tf_destroy:
+  resource_group: ${TF_INSTANCE} # Prevent multiple job executions for the same environment/state-file
+  environment:
+    name: ${TF_INSTANCE}
+    action: stop
+  variables:
+    TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_INSTANCE}
+    TF_ROOT: ${CI_PROJECT_DIR}/stacks/${TF_STACK}
+  before_script: # Install AWS CLI and assume role with web identity
+    - *aws-cli
+    - !reference [.assume-role, script]
+  script: # Leveraging Gitlab Terraform wrapper (https://gitlab.com/gitlab-org/terraform-images)
+    - gitlab-terraform destroy -var-file=${CI_PROJECT_DIR}/stacks/${TF_STACK}/instances/${TF_INSTANCE}/${TF_INSTANCE}.tfvars
+  rules:
+    - if: $DISABLE_TERRAFORM_DESTROY == "true" # Hide Terraform destroy job when this CICD variable is set to TRUE
+      when: never
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform destroy for all environments on default branch only
+      when: manual
+    - when: never
+  timeout: 3h
