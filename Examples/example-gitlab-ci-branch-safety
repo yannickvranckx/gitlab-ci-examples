@@ -1,0 +1,576 @@
+############################################################################################################
+# To avoid duplicate pipelines (branch and merge request pipelines) when a merge request is open.          #
+# This workflow will block the branch pipeline and only trigger the merge request pipeline.                #
+############################################################################################################
+workflow:
+  rules:
+    # Branch pipelines are omitted when there is an open merge request for that branch (excludes manual triggers)
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    # Merge request pipeline is always triggered
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+    # In all other case branch pipelines are executed
+    - if: $CI_COMMIT_BRANCH
+      when: always
+    # All manual trigger via Gitlab UI
+    - if: $CI_PIPELINE_SOURCE == 'web'
+      when: always
+
+######################################################
+# Default and identical variables across all jobs    #
+######################################################
+variables:
+  TF_HTTP_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STACK}-${TF_ENV}
+  TF_HTTP_LOCK_ADDRESS: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_UNLOCK_ADDRESS: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_LOCK_METHOD: POST
+  TF_HTTP_UNLOCK_METHOD: DELETE
+  TF_HTTP_RETRY_WAIT_MIN: 5
+  TF_HTTP_USERNAME: gitlab-ci-token
+  TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+  TF_ROOT: ${CI_PROJECT_DIR}/terraform
+  TF_STACK_ROOT: ${TF_ROOT}/stacks/${TF_STACK}
+  TF_PLAN_CACHE: ${TF_STACK_ROOT}/plan-${TF_ENV}.cache
+  TF_PLAN_JSON: ${TF_STACK_ROOT}/plan-${TF_ENV}.json
+  AWS_DEFAULT_REGION: eu-west-3
+  DOCKER_IMAGE_TAG: latest
+
+######################################################
+# Default configurations                             #
+######################################################
+default:
+  # TODO: Create custom docker image for Terraform including all tools
+  image: registry.gitlab.com/luminusbe/luminusbe-neo/luminusbe-neo-shared/base_images/ubuntu:latest
+  # Unique cache per stack/env to improve Terraform initialization time
+  cache:
+    key: terraform-${TF_STACK}-${TF_ENV}-${CI_PIPELINE_ID}
+    paths:
+      - ${TF_STACK_ROOT}/.terraform
+      - ${TF_STACK_ROOT}/.terraform.lock.hcl
+      - ${TF_PLAN_JSON}
+      - ${TF_PLAN_CACHE}
+  # Tags to indicate the required Gitlab hosted runners
+  tags:
+    - saas-linux-small-amd64
+  # Configuration for Gitlab OpenID Connect (OIDC) for AWS
+  id_tokens:
+    GITLAB_JWT_TOKEN:
+      aud: https://gitlab.com
+
+######################################################
+# CICD pipeline stages                               #
+######################################################
+stages:
+  - validation
+  - scanning
+  - build
+  - push
+  - review
+  - deployment
+  - termination
+
+######################################################
+# Default and external template includes             #
+######################################################
+include:
+  - project: ${NEO_TEMPLATE_REPO}
+    file: /gitlab-ci/assume-role.yml
+  - local: .gitlab-ci/utils.yaml
+
+######################################################
+#  Application version checks                        #
+######################################################
+gen-ai-gateway:dispatcher:version-check:
+  extends: .version-check
+  variables:
+    # Spell directories explicitly because GitLab cannot do variable expansions in rules
+    STACK_DIR: terraform/stacks/gen-ai-gateway
+    APP_DIR: applications/dispatcher
+
+######################################################
+# Terraform lint scanning                            #
+######################################################
+stack:neo-ai-platform:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: neo-ai-platform
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+stack:neo-ai-applications:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: neo-ai-applications
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+stack:gen-ai-gateway:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: gen-ai-gateway
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+module:lambda:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: lambda
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:api_gateway:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: api_gateway
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:endpoint:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: endpoint
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:account:tflint:
+  extends: .terraform-tflint
+  variables:
+    TF_TARGET: account
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+######################################################
+# Terraform vulnerability scanning                   #
+######################################################
+stack:neo-ai-platform:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: neo-ai-platform
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+stack:neo-ai-applications:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: neo-ai-applications
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+stack:gen-ai-gateway:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: gen-ai-gateway
+    TF_TARGET_DIR: ${TF_ROOT}/stacks/${TF_TARGET}
+
+module:lambda:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: lambda
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:api_gateway:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: api_gateway
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:endpoint:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: endpoint
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+module:account:checkov:
+  extends: .terraform-checkov
+  variables:
+    TF_TARGET: account
+    TF_TARGET_DIR: ${TF_ROOT}/modules/${TF_TARGET}
+
+######################################################
+# Terraform init and validation                      #
+######################################################
+neo-ai-platform:dev:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: neo-ai-platform
+    TF_ENV: dev
+
+neo-ai-platform:acc:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: neo-ai-platform
+    TF_ENV: acc
+
+neo-ai-platform:pro:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: neo-ai-platform
+    TF_ENV: pro
+
+neo-ai-applications:dev:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_DEV}
+    TF_STACK: neo-ai-applications
+    TF_ENV: dev
+
+neo-ai-applications:acc:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_ACC}
+    TF_STACK: neo-ai-applications
+    TF_ENV: acc
+
+neo-ai-applications:pro:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_PRO}
+    TF_STACK: neo-ai-applications
+    TF_ENV: pro
+
+gen-ai-gateway:dev:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: dev
+
+gen-ai-gateway:acc:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: acc
+
+gen-ai-gateway:pro:init:
+  extends: .terraform-init
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: pro
+
+######################################################
+# App build                                          #
+######################################################
+gen-ai-gateway:dispatcher:build:
+  stage: build
+  extends: .docker-build
+  variables:
+    APP_DIR: applications/dispatcher
+    STACK_DIR: terraform/stacks/gen-ai-gateway
+    DOCKER_IMAGE_NAME: dispatcher
+    DOCKER_IMAGE_NAMESPACE: neo/ai
+    DOCKER_IMAGE_TAG_COMMIT_SHA: ${CI_COMMIT_SHA}
+
+######################################################
+# App push                                           #
+######################################################
+gen-ai-gateway:dispatcher:dev:push:
+  stage: push
+  extends: .docker-push
+  variables:
+    APP_DIR: applications/dispatcher
+    STACK_DIR: terraform/stacks/gen-ai-gateway
+    DOCKER_IMAGE_NAME: dispatcher
+    DOCKER_IMAGE_NAMESPACE: neo/ai
+    DOCKER_IMAGE_TAG_VERSION_FILE: terraform/stacks/gen-ai-gateway/VERSION
+    DOCKER_IMAGE_TAG_COMMIT_SHA: ${CI_COMMIT_SHA}
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    AWS_ACCOUNT: ${AWS_ACCOUNT_PLATFORM_DEV}
+    TF_ENV: dev
+  dependencies:
+    - gen-ai-gateway:dispatcher:build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - "${APP_DIR}/**/*"
+        - "${STACK_DIR}/**/*"
+    - if: $CI_COMMIT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+      changes:
+        paths:
+          - "${APP_DIR}/**/*"
+          - "${STACK_DIR}/**/*"
+        compare_to: $CI_DEFAULT_BRANCH
+    - when: never
+
+gen-ai-gateway:dispatcher:acc:push:
+  stage: push
+  extends: .docker-push
+  variables:
+    APP_DIR: applications/dispatcher
+    STACK_DIR: terraform/stacks/gen-ai-gateway
+    DOCKER_IMAGE_NAME: dispatcher
+    DOCKER_IMAGE_NAMESPACE: neo/ai
+    DOCKER_IMAGE_TAG_VERSION_FILE: terraform/stacks/gen-ai-gateway/VERSION
+    DOCKER_IMAGE_TAG_COMMIT_SHA: ${CI_COMMIT_SHA}
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    AWS_ACCOUNT: ${AWS_ACCOUNT_PLATFORM_ACC}
+    TF_ENV: acc
+  dependencies:
+    - gen-ai-gateway:dispatcher:build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - "${APP_DIR}/**/*"
+        - "${STACK_DIR}/**/*"
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      when: on_success
+      changes:
+        paths:
+          - "${APP_DIR}/**/*"
+          - "${STACK_DIR}/**/*"
+        compare_to: $CI_DEFAULT_BRANCH
+    - when: never
+
+gen-ai-gateway:dispatcher:pro:push:
+  stage: push
+  extends: .docker-push
+  variables:
+    APP_DIR: applications/dispatcher
+    STACK_DIR: terraform/stacks/gen-ai-gateway
+    DOCKER_IMAGE_NAME: dispatcher
+    DOCKER_IMAGE_NAMESPACE: neo/ai
+    DOCKER_IMAGE_TAG_VERSION_FILE: terraform/stacks/gen-ai-gateway/VERSION
+    DOCKER_IMAGE_TAG_COMMIT_SHA: ${CI_COMMIT_SHA}
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    AWS_ACCOUNT: ${AWS_ACCOUNT_PLATFORM_PRO}
+    TF_ENV: pro
+  dependencies:
+    - gen-ai-gateway:dispatcher:build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - "${APP_DIR}/**/*"
+        - "${STACK_DIR}/**/*"
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      when: on_success
+      changes:
+        paths:
+          - "${APP_DIR}/**/*"
+          - "${STACK_DIR}/**/*"
+        compare_to: $CI_DEFAULT_BRANCH
+    - when: never
+
+######################################################
+# Terraform plan review                              #
+######################################################
+neo-ai-platform:dev:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: neo-ai-platform
+    TF_ENV: dev
+
+neo-ai-platform:acc:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: neo-ai-platform
+    TF_ENV: acc
+
+neo-ai-platform:pro:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: neo-ai-platform
+    TF_ENV: pro
+
+neo-ai-applications:dev:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_DEV}
+    TF_STACK: neo-ai-applications
+    TF_ENV: dev
+
+neo-ai-applications:acc:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_ACC}
+    TF_STACK: neo-ai-applications
+    TF_ENV: acc
+
+neo-ai-applications:pro:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_PRO}
+    TF_STACK: neo-ai-applications
+    TF_ENV: pro
+
+gen-ai-gateway:dev:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: dev
+
+gen-ai-gateway:acc:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: acc
+
+gen-ai-gateway:pro:plan:
+  extends: .terraform-plan
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: pro
+
+######################################################
+# Terraform apply changes                            #
+######################################################
+neo-ai-platform:dev:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: neo-ai-platform
+    TF_ENV: dev
+  rules:
+    - when: manual
+
+neo-ai-platform:acc:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: neo-ai-platform
+    TF_ENV: acc
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+neo-ai-platform:pro:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: neo-ai-platform
+    TF_ENV: pro
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+neo-ai-applications:dev:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_DEV}
+    TF_STACK: neo-ai-applications
+    TF_ENV: dev
+  rules:
+    - when: manual
+
+neo-ai-applications:acc:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_ACC}
+    TF_STACK: neo-ai-applications
+    TF_ENV: acc
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+neo-ai-applications:pro:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_PRO}
+    TF_STACK: neo-ai-applications
+    TF_ENV: pro
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+gen-ai-gateway:dev:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: dev
+  rules:
+    - when: manual
+
+gen-ai-gateway:acc:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: acc
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+gen-ai-gateway:pro:apply:
+  extends: .terraform-apply
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: pro
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH # Allow Terraform apply on default branch
+      when: manual
+    - when: never
+
+######################################################
+# Terraform destroy environment                      #
+######################################################
+neo-ai-platform:dev:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: neo-ai-platform
+    TF_ENV: dev
+
+neo-ai-platform:acc:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: neo-ai-platform
+    TF_ENV: acc
+
+neo-ai-platform:pro:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: neo-ai-platform
+    TF_ENV: pro
+
+neo-ai-applications:dev:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_DEV}
+    TF_STACK: neo-ai-applications
+    TF_ENV: dev
+
+neo-ai-applications:acc:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_ACC}
+    TF_STACK: neo-ai-applications
+    TF_ENV: acc
+
+neo-ai-applications:pro:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_APPLICATIONS_PRO}
+    TF_STACK: neo-ai-applications
+    TF_ENV: pro
+
+gen-ai-gateway:dev:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_DEV}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: dev
+
+gen-ai-gateway:acc:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_ACC}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: acc
+
+gen-ai-gateway:pro:destroy:
+  extends: .terraform-destroy
+  variables:
+    AWS_ROLE_ARN: ${GITLAB_ROLE_ARN_PLATFORM_PRO}
+    TF_STACK: gen-ai-gateway
+    TF_ENV: pro
